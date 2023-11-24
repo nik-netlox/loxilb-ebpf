@@ -52,6 +52,7 @@ dp_ing_pkt_main(void *md, struct xfi *xf)
 
   if (xf->pm.pipe_act & LLB_PIPE_PASS ||
       xf->pm.pipe_act & LLB_PIPE_TRAP) {
+    xf->pm.rcode |= LLB_PIPE_RC_MPT_PASS;
     return DP_PASS;
   }
 
@@ -73,7 +74,30 @@ int  xdp_packet_func(struct xdp_md *ctx)
   }
   memset(xf, 0, sizeof *xf);
 
-  dp_parse_d0(ctx, xf, 0);
+  dp_parse_d0(ctx, xf, 1);
+
+#ifdef HAVE_DP_RSS
+  if (xf->l2m.dl_type == bpf_ntohs(ETH_P_IP) &&
+      xf->l34m.nw_proto == IPPROTO_SCTP) {
+      __u32 dcpu;
+      __u32 *mcpu;
+      __u32 seed = bpf_get_prandom_u32();
+      __u32 hash = (__u32)(xf->l34m.saddr[0]) ^
+                   ((__u32)(xf->l34m.source)) ^
+                   seed;
+      dcpu = hash % MAX_REAL_CPUS;
+      mcpu = bpf_map_lookup_elem(&live_cpu_map, &z);
+      if (mcpu == NULL) {
+        return DP_PASS;
+      }
+
+      if (dcpu >= *mcpu) {
+        dcpu = 0;
+      }
+
+      return bpf_redirect_map(&cpu_map, dcpu, 0);
+  }
+#endif
 
   return DP_PASS;
 }
@@ -97,10 +121,13 @@ tc_packet_func__(struct __sk_buff *md)
     return DP_DROP;
   }
 
-  if (xf->pm.phit & LLB_DP_FC_HIT) {
-    memset(xf, 0, sizeof(*xf));
-    xf->pm.phit |= LLB_DP_FC_HIT;
-  }
+  //if (xf->pm.phit & LLB_DP_FC_HIT) {
+  //  memset(xf, 0, sizeof(*xf));
+  //  xf->pm.phit |= LLB_DP_FC_HIT;
+  //}
+
+  memset(xf, 0, sizeof(*xf));
+  xf->pm.phit |= LLB_DP_FC_HIT;
   xf->pm.tc = 1;
 
   return dp_ing_pkt_main(md, xf);
@@ -109,18 +136,23 @@ tc_packet_func__(struct __sk_buff *md)
 SEC("tc_packet_hook0")
 int tc_packet_func_fast(struct __sk_buff *md)
 {
+#ifdef LL_TC_EBPF_EHOOK
+  if (DP_LLB_STAMPED(md) || (md->ingress_ifindex == md->ifindex)) {
+    DP_LLB_RST_STAMP(md);
+    return DP_PASS;
+  } else {
+    DP_LLB_STAMP(md);
+  }
+#else
+  DP_LLB_STAMP(md);
+#endif
+
 #ifdef HAVE_DP_FC
   struct xfi *xf;
 
   DP_NEW_FCXF(xf);
 
-#ifdef HAVE_DP_EGR_HOOK
-  if (DP_LLB_INGP(md)) {
-    return DP_PASS;
-  }
-#endif
-
-  dp_parse_d0(md, xf, 0);
+  dp_parse_d0(md, xf, 1);
 
   return dp_ing_fc_main(md, xf);
 #else
@@ -173,7 +205,12 @@ int tc_csum_func1(struct __sk_buff *md)
     return DP_DROP;
   }
 
-  return dp_sctp_csum(md, xf);
+  val = dp_sctp_csum(md, xf);
+  if (val == DP_DROP || val == DP_PASS) {
+    xf->pm.rcode |= LLB_PIPE_RC_CSUM_DRP;
+    TRACER_CALL(md, xf);
+  }
+  return val;
 }
 
 SEC("tc_packet_hook5")
@@ -187,7 +224,12 @@ int tc_csum_func2(struct __sk_buff *md)
     return DP_DROP;
   }
 
-  return dp_sctp_csum(md, xf);
+  val = dp_sctp_csum(md, xf);
+  if (val == DP_DROP || val == DP_PASS) {
+    xf->pm.rcode |= LLB_PIPE_RC_CSUM_DRP;
+    TRACER_CALL(md, xf);
+  }
+  return val;
 }
 
 SEC("tc_packet_hook6")
@@ -201,7 +243,12 @@ int tc_slow_unp_func(struct __sk_buff *md)
     return DP_DROP;
   }
 
-  return dp_unparse_packet_always_slow(md, xf);
+  val = dp_unparse_packet_always_slow(md, xf);
+  if (val == DP_DROP) {
+    xf->pm.rcode |= LLB_PIPE_RC_UNPS_DRP;
+    TRACER_CALL(md, xf);
+  }
+  return val;
 }
 
 #endif

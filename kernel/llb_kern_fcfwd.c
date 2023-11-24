@@ -106,18 +106,20 @@ dp_do_fcv4_lkup(void *ctx, struct xfi *xf)
     LL_FC_PRINTK("[FCH4] hto");
     bpf_map_update_elem(&xfck, &z, &key, BPF_ANY);
     bpf_map_delete_elem(&fc_v4_map, &key);
+    xf->pm.rcode |= LLB_PIPE_RC_FCTO;
     return 0; 
   }
 
   LL_FC_PRINTK("[FCH4] key found act-sz %d\n", sizeof(struct dp_fc_tacts));
 
-  if (acts->ca.ftrap)
+  if (acts->ca.ftrap) {
+    xf->pm.rcode |= LLB_PIPE_RC_FCBP;
     return 0; 
+  }
 
   xf->pm.phit |= LLB_DP_FC_HIT;
-
   xf->pm.zone = acts->zone;
-
+  xf->pm.pten = acts->pten;
 
 #ifdef HAVE_DP_EXTFC
   if (acts->fcta[DP_SET_RM_VXLAN].ca.act_type == DP_SET_RM_VXLAN) {
@@ -132,21 +134,23 @@ dp_do_fcv4_lkup(void *ctx, struct xfi *xf)
     ta = &acts->fcta[DP_SET_SNAT];
 
     if (ta->nat_act.fr == 1 || ta->nat_act.doct) {
+      xf->pm.rcode |= LLB_PIPE_RC_FCBP;
       return 0;
     }
 
     dp_pipe_set_nat(ctx, xf, &ta->nat_act, 1);
-    dp_do_map_stats(ctx, xf, LL_DP_NAT_STATS_MAP, ta->nat_act.rid);
+    dp_do_map_stats(ctx, xf, LL_DP_NAT_STATS_MAP, LLB_NAT_STAT_CID(ta->nat_act.rid, ta->nat_act.aid));
   } else if (acts->fcta[DP_SET_DNAT].ca.act_type == DP_SET_DNAT) {
     LL_FC_PRINTK("[FCH4] dnat-act\n");
     ta = &acts->fcta[DP_SET_DNAT];
 
     if (ta->nat_act.fr == 1 || ta->nat_act.doct) {
+      xf->pm.rcode |= LLB_PIPE_RC_FCBP;
       return 0;
     }
 
     dp_pipe_set_nat(ctx, xf, &ta->nat_act, 0);
-    dp_do_map_stats(ctx, xf, LL_DP_NAT_STATS_MAP, ta->nat_act.rid);
+    dp_do_map_stats(ctx, xf, LL_DP_NAT_STATS_MAP, LLB_NAT_STAT_CID(ta->nat_act.rid, ta->nat_act.aid));
   }
 
 
@@ -212,6 +216,7 @@ dp_do_fcv4_lkup(void *ctx, struct xfi *xf)
 
 del_out:
   bpf_map_delete_elem(&fc_v4_map, &key);
+  xf->pm.rcode |= LLB_PIPE_RC_FCBP;
   return 0;
 }
 
@@ -226,9 +231,7 @@ dp_ing_fc_main(void *ctx, struct xfi *xf)
     if (dp_do_fcv4_lkup(ctx, xf) == 1) {
       if (xf->pm.pipe_act == LLB_PIPE_RDR) {
         int oif = xf->pm.oport;
-#ifdef HAVE_DP_EGR_HOOK
-        DP_LLB_MRK_INGP(ctx);
-#endif
+        TRACER_CALL(ctx, xf);
         return bpf_redirect(oif, 0);         
       }
     }
@@ -236,5 +239,7 @@ dp_ing_fc_main(void *ctx, struct xfi *xf)
 
   bpf_map_update_elem(&xfis, &z, xf, BPF_ANY);
   bpf_tail_call(ctx, &pgm_tbl, idx);
-  return DP_PASS;
+
+  TRACER_CALL(ctx, xf);
+  return DP_DROP;
 }

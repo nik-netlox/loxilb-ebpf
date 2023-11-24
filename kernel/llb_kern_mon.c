@@ -52,15 +52,19 @@ log_map_update(struct pt_regs *ctx, struct bpf_map* updated_map,
   // Parse the Key
   if (key_size <= MAX_KEY_SIZE) {
     bpf_probe_read(out_data.key, key_size, pKey);
+    out_data.key_size = key_size;
   } else {
     bpf_probe_read(out_data.key, MAX_KEY_SIZE, pKey);
+    out_data.key_size = MAX_KEY_SIZE;
   }
   // Parse the Value
   if (pValue) {
     if (value_size <= MAX_VALUE_SIZE) {
       bpf_probe_read(out_data.value, value_size, pValue);
+      out_data.value_size = value_size;
     } else {
       bpf_probe_read(out_data.value, MAX_VALUE_SIZE, pValue);
+      out_data.value_size = MAX_VALUE_SIZE;
     }
   } else {
     out_data.value_size = 0;
@@ -91,8 +95,12 @@ int bpf_prog_kern_hmapdelete(struct pt_regs *ctx)
   char *pKey = (char*)PT_REGS_PARM2(ctx);
   char *pValue = NULL;
 
+#ifndef HAVE_DP_DEL_MON
+  return 0;
+#else
   log_map_update(ctx, updated_map, pKey, pValue, DELETE_KERNEL);
   return 0;
+#endif
 }
 
 SEC("kprobe/htab_map_lookup_and_delete_elem")
@@ -101,10 +109,15 @@ int bpf_prog_kern_hmaplkdelete(struct pt_regs *ctx)
   // Parse functions params
   struct bpf_map* updated_map = (struct bpf_map* ) PT_REGS_PARM1(ctx);
   char *pKey = (char*)PT_REGS_PARM2(ctx);
-  char *pValue = (char*)PT_REGS_PARM3(ctx);
+  //char *pValue = (char*)PT_REGS_PARM3(ctx);
+  char *pValue = NULL;
 
+#ifndef HAVE_DP_DEL_MON
+  return 0;
+#else
   log_map_update(ctx, updated_map, pKey, pValue, DELETE_KERNEL);
   return 0;
+#endif
 }
 
 #ifdef HAVE_DP_EXT_MON 

@@ -17,9 +17,11 @@ BPFTOOL ?= bpftool
 
 XDP_C = ${XDP_TARGETS:=.c}
 TC_C = ${TC_TARGETS:=.c}
+TC_EC = ${TC_ETARGETS:=.c}
 MON_C = ${MON_TARGETS:=.c}
 XDP_OBJ = ${XDP_C:.c=.o}
 TC_OBJ = ${TC_C:.c=.o}
+TC_EOBJ = ${TC_EC:.c=.o}
 MON_OBJ = ${MON_C:.c=.o}
 USER_C := ${USER_TARGETS:=.c}
 USER_OBJ := ${USER_C:.c=.o}
@@ -62,7 +64,7 @@ LIBBPF_DIR ?= ../libbpf/src/
 OBJECT_LIBBPF = $(LIBBPF_DIR)/libbpf.a
 
 # Extend if including Makefile already added some
-COMMON_OBJS += $(COMMON_DIR)/common_sum.o $(COMMON_DIR)/common_user_bpf_xdp.o $(COMMON_DIR)/common_pdi.o $(COMMON_DIR)/common_frame.o
+COMMON_OBJS += $(COMMON_DIR)/common_sum.o $(COMMON_DIR)/common_user_bpf_xdp.o $(COMMON_DIR)/common_pdi.o $(COMMON_DIR)/common_frame.o $(COMMON_DIR)/log.o
 
 # Create expansions for dependencies
 COMMON_H := ${COMMON_OBJS:.o=.h}
@@ -72,7 +74,7 @@ EXTRA_DEPS +=
 # BPF-prog kern and userspace shares struct via header file:
 KERN_USER_H ?= $(wildcard common_kern_user.h)
 
-CFLAGS_ALL ?= -DHAVE_DP_FC=1 -DHAVE_DP_EXTCT=1 -DHAVE_DP_SCTP_SUM=1 -DHAVE_DP_CT_SYNC=1
+CFLAGS_ALL ?= -DHAVE_DP_FC=1 -DHAVE_DP_EXTCT=1 -DHAVE_DP_SCTP_SUM=1 -DHAVE_DP_CT_SYNC=1 -DMAX_REAL_CPUS=40 -DHAVE_DP_RSS=1
 ifeq ($(CLANG), clang-13)
 CFLAGS_ALL += -DHAVE_CLANG13
 endif
@@ -84,7 +86,7 @@ BPF_CFLAGS ?= -I$(LIBBPF_DIR)/build/usr/include/ -I../headers/ -I/usr/include/$(
 
 LIBS = $(OBJECT_LIBBPF) -lelf $(USER_LIBS) -lz -lpthread
 
-all: llvm-check $(USER_TARGETS) $(XDP_OBJ) $(TC_OBJ) $(MON_OBJ) $(USER_TARGETS_LIB)
+all: llvm-check $(USER_TARGETS) $(XDP_OBJ) $(TC_OBJ) $(TC_EOBJ) $(MON_OBJ) $(USER_TARGETS_LIB)
 #all: llvm-check $(XDP_OBJ) $(USER_TARGETS_LIB)
 
 .PHONY: clean $(CLANG) $(LLC) vmlinux
@@ -94,6 +96,8 @@ clean:
 	$(MAKE) -C $(LIBBPF_DIR) clean
 	$(MAKE) -C $(COMMON_DIR) clean
 	rm -f $(USER_TARGETS) $(XDP_OBJ) $(USER_OBJ)
+	rm -f loxilb_dp_debug 
+	rm -f $@
 	rm -f *.ll
 	rm -f *~
 
@@ -129,7 +133,7 @@ $(COMMON_OBJS): %.o: %.h
 	make -C $(COMMON_DIR)
 
 $(USER_TARGETS): %: %.c  $(OBJECT_LIBBPF) Makefile $(COMMON_MK) $(COMMON_OBJS) $(KERN_USER_H) $(EXTRA_DEPS) %.skel.h
-	$(CC) -Wall $(CFLAGS) $(LDFLAGS) -o $@ loxilb_libdp_main.c $(COMMON_OBJS) \
+	$(CC) -Wall $(CFLAGS) $(LDFLAGS) -o loxilb_dp_debug loxilb_dp_debug.c $(COMMON_OBJS) \
 	 $< $(LIBS)
 
 $(USER_TARGETS_LIB): %: $(USER_OBJ) $(COMMON_OBJS)
@@ -167,6 +171,23 @@ $(TC_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DE
 		-O2 -g -c -o ${@:.o=.o} $<
 	#$(LLC) -march=bpf -mattr=dwarfris -filetype=obj -o $@ ${@:.o=.o}
 	sudo mv $@ /opt/loxilb/ 
+	@#sudo pahole -J /opt/loxilb/$@
+
+$(TC_EOBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DEPS)
+	$(CLANG) \
+		-target bpf \
+		-D __BPF_TRACING__ \
+		-DLL_TC_EBPF=1 \
+		-DLL_TC_EBPF_EHOOK=1 \
+		$(BPF_CFLAGS) \
+		-Wall \
+		-Wno-unused-value \
+		-Wno-pointer-sign \
+		-Wno-compare-distinct-pointer-types \
+		-Werror \
+		-O2 -g -c -o ${@:.o=.o} $<
+	#$(LLC) -march=bpf -mattr=dwarfris -filetype=obj -o $@ ${@:.o=.o}
+	sudo mv $@ /opt/loxilb/
 	@#sudo pahole -J /opt/loxilb/$@
 
 vmlinux:

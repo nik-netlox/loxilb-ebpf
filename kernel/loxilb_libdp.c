@@ -16,6 +16,8 @@
 #include <time.h>
 #include <assert.h>
 #include <pthread.h>
+#include <netdb.h>
+#include <ifaddrs.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 
@@ -24,6 +26,7 @@
 
 #include <net/if.h>
 #include <arpa/inet.h>
+#include <linux/unistd.h>
 #include <linux/if_ether.h>
 #include <linux/if_link.h>
 #include <linux/if_tun.h>
@@ -76,6 +79,7 @@ typedef struct llb_dp_map {
 typedef struct llb_dp_struct
 {
   pthread_rwlock_t lock;
+  pthread_rwlock_t mplock;
   const char *ll_dp_fname;
   const char *ll_tc_fname;
   const char *ll_dp_dfl_sec;
@@ -84,29 +88,48 @@ typedef struct llb_dp_struct
   pthread_t mon_thr;
   int mgmt_ch_fd;
   int have_mtrace;
+  int have_ptrace;
+  int have_loader;
+  int egr_hooks;
   int nodenum;
   llb_dp_map_t maps[LL_DP_MAX_MAP];
   llb_dp_link_t links[LLB_INTERFACES];
   llb_dp_sect_t psecs[LLB_PSECS];
   struct pdi_map *ufw4;
   struct pdi_map *ufw6;
+  FILE *logfp;
 } llb_dp_struct_t;
 
 #define XH_LOCK()    pthread_rwlock_wrlock(&xh->lock)
 #define XH_RD_LOCK() pthread_rwlock_rdlock(&xh->lock)
 #define XH_UNLOCK()  pthread_rwlock_unlock(&xh->lock)
+
+#define XH_MPLOCK()  pthread_rwlock_wrlock(&xh->mplock)
+#define XH_MPUNLOCK() pthread_rwlock_unlock(&xh->mplock)
+
 #define XH_BPF_OBJ() xh->links[0].obj
 
 llb_dp_struct_t *xh;
+static uint64_t lost;
 
 static inline unsigned int
 bpf_num_possible_cpus(void)
 {
-	int possible_cpus = libbpf_num_possible_cpus();
-	if (possible_cpus < 0) {
-		return 0;
-	}
-	return possible_cpus;
+  int possible_cpus = libbpf_num_possible_cpus();
+  if (possible_cpus < 0) {
+    return 0;
+  }
+  return possible_cpus;
+}
+
+static inline unsigned int
+bpf_num_online_cpus(void)
+{
+  int online_cpus = libbpf_num_online_cpus();
+  if (online_cpus < 0) {
+    return 0;
+  }
+  return online_cpus;
 }
 
 static void
@@ -145,29 +168,171 @@ libbpf_print_fn(enum libbpf_print_level level,
 }
 
 static void
-llb_handle_pkt_event(void *ctx,
-                    int cpu,
-                    void *data,
-                    unsigned int data_sz)
+llb_decode_pmdata(char *buf, struct ll_dp_pmdi *pmd)
+{
+  int n = 0;
+  if (pmd->phit) {
+    n += sprintf(buf + n, "phit:");
+    if (pmd->phit &  LLB_DP_FC_HIT) {
+      n += sprintf(buf + n, "fc,");
+    }
+    if (pmd->phit &  LLB_DP_IF_HIT) {
+      n += sprintf(buf + n, "if,");
+    }
+    if (pmd->phit &  LLB_DP_TMAC_HIT) {
+      n += sprintf(buf + n, "tmac,");
+    }
+    if (pmd->phit &  LLB_DP_CTM_HIT) {
+      n += sprintf(buf + n, "ct,");
+    }
+    if (pmd->phit &  LLB_DP_RT_HIT) {
+      n += sprintf(buf + n, "rt,");
+    }
+    if (pmd->phit &  LLB_DP_SESS_HIT) {
+      n += sprintf(buf + n, "ses,");
+    }
+        if (pmd->phit &  LLB_DP_FW_HIT) {
+      n += sprintf(buf + n, "fw,");
+    }
+    if (pmd->phit &  LLB_DP_CTSI_HIT) {
+      n += sprintf(buf + n, "cti,");
+    }
+    if (pmd->phit &  LLB_DP_CTSO_HIT) {
+      n += sprintf(buf + n, "cto,");
+    }
+    if (pmd->phit &  LLB_DP_NAT_HIT) {
+      n += sprintf(buf + n, "nat,");
+    }
+    if (pmd->phit &  LLB_DP_CSUM_HIT) {
+      n += sprintf(buf + n, "csum,");
+    }
+    if (pmd->phit &  LLB_DP_UNPS_HIT) {
+      n += sprintf(buf + n, "unps,");
+    }
+    if (pmd->phit &  LLB_DP_NEIGH_HIT) {
+      n += sprintf(buf + n, "nh,");
+    }
+    if (pmd->phit &  LLB_DP_DMAC_HIT) {
+      n += sprintf(buf + n, "dm,");
+    }
+    if (pmd->phit &  LLB_DP_SMAC_HIT) {
+      n += sprintf(buf + n, "sm,");
+    }
+    if (pmd->phit &  LLB_DP_RES_HIT) {
+      n += sprintf(buf + n, "res,");
+    }
+    n += sprintf(buf + n, "** ");
+  }
+
+  if (pmd->rcode) {
+     n += sprintf(buf + n, "rcode:");
+    if (pmd->rcode & LLB_PIPE_RC_PARSER) {
+      n += sprintf(buf + n, "parser,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_ACL_TRAP) {
+      n += sprintf(buf + n, "acl-trap,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_RT_TRAP) {
+      n += sprintf(buf + n, "rt-trap,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_TUN_DECAP) {
+      n += sprintf(buf + n, "tun-decap,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_TUN_DECAP) {
+      n += sprintf(buf + n, "tun-decap,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_FW_RDR) {
+      n += sprintf(buf + n, "fw-rdr,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_FW_DRP) {
+      n += sprintf(buf + n, "fw-drp,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_UNPS_DRP) {
+      n += sprintf(buf + n, "unps-drp,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_CSUM_DRP) {
+      n += sprintf(buf + n, "csum-drp,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_UNX_DRP) {
+      n += sprintf(buf + n, "unx-drp,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_FCTO) {
+      n += sprintf(buf + n, "fc-to,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_FCBP) {
+      n += sprintf(buf + n, "fc-break,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_PLERR) {
+      n += sprintf(buf + n, "plen-err,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_PROTO_ERR) {
+      n += sprintf(buf + n, "proto-err,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_PLCT_ERR) {
+      n += sprintf(buf + n, "ct-plen-err,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_ACT_DROP) {
+      n += sprintf(buf + n, "adrop,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_ACT_UNK) {
+      n += sprintf(buf + n, "aunk,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_TCALL_ERR) {
+      n += sprintf(buf + n, "tcall-err,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_ACT_TRAP) {
+      n += sprintf(buf + n, "atrap,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_PLRT_ERR) {
+      n += sprintf(buf + n, "rt-plen-err,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_PLCS_ERR) {
+      n += sprintf(buf + n, "csum-plen-err,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_BCMC) {
+      n += sprintf(buf + n, "bcmc,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_POL_DRP) {
+      n += sprintf(buf + n, "policer-drop,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_NOSMAC) {
+      n += sprintf(buf + n, "smac-excp,");
+    }
+    if (pmd->rcode & LLB_PIPE_RC_NODMAC) {
+      n += sprintf(buf + n, "dmac-excp,");
+    }
+  }
+}
+
+static void
+llb_handle_pkt_tracer_event(void *ctx,
+             int cpu,
+             void *data,
+             unsigned int data_sz)
 {
   struct ll_dp_pmdi *pmd = data;
   struct tm *tm;
-  char ts[32];
+  char *pif;
   time_t t;
+  char ts[32];
+  char ifname[IFNAMSIZ];
+  char pmdecode[1024];
 
   time(&t);
   tm = localtime(&t);
   strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+  llb_decode_pmdata(pmdecode, pmd);
 
-  printf("%-8s %-5s %-7d %-16d %-3d %-16d %-8d\n", ts, "PKT", 
-         pmd->ifindex, pmd->xdp_inport, pmd->table_id,
-         pmd->rcode, pmd->pkt_len);
+  pif = if_indextoname(pmd->ifindex, ifname);
 
-  ll_pretty_hex(pmd->data, pmd->pkt_len);
+  printf("%-8s %-4s:%-4d ifi:%-4d(%s) iport:%-3d oport:%-3d tbl:%-2d %s\n", ts, "PKT", 
+       pmd->pkt_len, pmd->ifindex, pif?:"", pmd->dp_inport, pmd->dp_oport, pmd->table_id, pmdecode);
+
+  ll_pretty_hex(pmd->data, pmd->pkt_len > 64 ? 64: pmd->pkt_len);
 }
 
 static void *
-llb_pkt_proc_main(void *arg)
+llb_trace_proc_main(void *arg)
 {
   struct perf_buffer *pb = arg;
 
@@ -180,7 +345,76 @@ llb_pkt_proc_main(void *arg)
 }
 
 static int
-llb_setup_pkt_ring(struct bpf_object *bpf_obj __attribute__((unused)))
+ll_fcmap_ent_set_flush(int tid, void *k, void *ita)
+{
+  return 1;
+}
+
+static void
+ll_flush_fcmap(void)
+{
+  dp_map_ita_t it;
+  struct dp_fcv4_key next_key;
+  struct dp_fc_tacts *fc_val;
+  uint64_t ns = get_os_nsecs();
+
+  fc_val = calloc(1, sizeof(*fc_val));
+  if (!fc_val) return;
+
+  memset(&it, 0, sizeof(it));
+  it.next_key = &next_key;
+  it.val = fc_val;
+  it.uarg = &ns;
+
+  XH_LOCK();
+  llb_map_loop_and_delete(LL_DP_FCV4_MAP, ll_fcmap_ent_set_flush, &it);
+  XH_UNLOCK();
+  if (fc_val) free(fc_val);
+}
+
+int
+llb_packet_trace_en(int en)
+{
+  void *key = NULL;
+  int ifm_fd = xh->maps[LL_DP_INTF_MAP].map_fd;
+  struct intf_key nkey;
+  struct dp_intf_tact l2a;
+  void *next_key = &nkey;
+
+  if (en < 0 || en > 2) {
+    return -1;
+  }
+
+  while (bpf_map_get_next_key(ifm_fd, &key, &next_key) == 0) {
+
+    if (bpf_map_lookup_elem(ifm_fd, &next_key, &l2a) != 0) {
+      goto next;
+    }
+
+    switch (en) {
+    case 2:
+      l2a.set_ifi.pten = 2;
+      break;
+    case 1:
+      l2a.set_ifi.pten = 1;
+      break;
+    case 0:
+      l2a.set_ifi.pten = 0;
+      break;
+    }
+
+    bpf_map_update_elem(ifm_fd, &next_key, &l2a, BPF_ANY);
+next:
+    key = next_key;
+  }
+
+  ll_flush_fcmap();
+
+  return 0;
+}
+
+int
+llb_setup_pkt_ring(void)
 {
   struct perf_buffer *pb = NULL;
   struct perf_buffer_opts pb_opts = { 0 };
@@ -189,7 +423,7 @@ llb_setup_pkt_ring(struct bpf_object *bpf_obj __attribute__((unused)))
   if (pkt_fd < 0) return -1;
 
   /* Set up ring buffer polling */
-  pb_opts.sample_cb = llb_handle_pkt_event;
+  pb_opts.sample_cb = llb_handle_pkt_tracer_event;
 
   pb = perf_buffer__new(pkt_fd, 8 /* 32KB per CPU */, &pb_opts);
   if (libbpf_get_error(pb)) {
@@ -197,7 +431,7 @@ llb_setup_pkt_ring(struct bpf_object *bpf_obj __attribute__((unused)))
     goto cleanup;
   }
 
-  pthread_create(&xh->pkt_thr, NULL, llb_pkt_proc_main, pb);
+  pthread_create(&xh->pkt_thr, NULL, llb_trace_proc_main, pb);
 
   return 0;
 
@@ -212,6 +446,14 @@ cleanup:
 void __attribute__((weak))
 goMapNotiHandler(struct ll_dp_map_notif *mn)
 {
+}
+
+static void
+llb_maptrace_lost(void *ctx, int cpu, __u64 cnt)
+{
+  XH_LOCK();
+  lost += cnt;
+  XH_UNLOCK();
 }
 
 static void
@@ -326,19 +568,19 @@ llb_setup_kern_mon(void)
   // Open and load eBPF Program
   prog = llb_kern_mon__open();
   if (!prog) {
-      printf("Failed to open and load BPF skeleton\n");
+      log_error("Failed to open and load BPF skeleton");
       return 1;
   }
   err = llb_kern_mon__load(prog);
   if (err) {
-      printf("Failed to load and verify BPF skeleton\n");
+      log_error("Failed to load and verify BPF skeleton");
       goto cleanup;
   }
 
   // Attach the various kProbes
   err = llb_kern_mon__attach(prog);
   if (err) {
-      printf("Failed to attach BPF skeleton\n");
+      log_error("Failed to attach BPF skeleton");
       goto cleanup;
   }
 
@@ -346,10 +588,11 @@ llb_setup_kern_mon(void)
   struct perf_buffer_opts pb_opts = { 0 } ;
   struct perf_buffer *pb;
   pb_opts.sample_cb = llb_maptrace_output;
-  pb = perf_buffer__new(bpf_map__fd(prog->maps.map_events), 8, &pb_opts);
+  pb_opts.lost_cb = llb_maptrace_lost;
+  pb = perf_buffer__new(bpf_map__fd(prog->maps.map_events), 16384, &pb_opts);
   err = libbpf_get_error(pb);
   if (err) {
-    printf("failed to setup perf_buffer: %d\n", err);
+    log_error("failed to setup perf_buffer: %d", err);
     goto cleanup;
   }
 
@@ -386,14 +629,25 @@ llb_objmap2fd(struct bpf_object *bpf_obj,
 {
   struct bpf_map *map;
   int map_fd = -1;
+  char path[512];
 
-  map = bpf_object__find_map_by_name(bpf_obj, mapname);
-  if (!map) {
-    goto out;
+  if (bpf_obj == NULL) {
+    union bpf_attr attr;
+
+    snprintf(path, 512, "%s/%s", xh->ll_dp_pdir, mapname);
+    memset(&attr, 0, sizeof(attr));
+    attr.pathname = (__u64) (unsigned long)&path[0];
+    map_fd = syscall(__NR_bpf, BPF_OBJ_GET, &attr, sizeof(attr));
+
+  } else {
+    map = bpf_object__find_map_by_name(bpf_obj, mapname);
+    if (!map) {
+      goto out;
+    }
+
+    map_fd = bpf_map__fd(map);
   }
-
-  map_fd = bpf_map__fd(map);
-  printf("%s: %d\n", mapname, map_fd);
+  log_trace("%s: %d", mapname, map_fd);
 out:
   return map_fd;
 }
@@ -432,6 +686,35 @@ llb_setup_ctctr_map(int mapfd)
   bpf_map_update_elem(mapfd, &k, &ctr, BPF_ANY);
 }
 
+static void
+llb_setup_cpu_map(int mapfd)
+{
+  uint32_t qsz = 2048;
+  unsigned int live_cpus = bpf_num_possible_cpus();
+  int ret, i;
+
+  for (i = 0; i < live_cpus; i++) {
+    ret = bpf_map_update_elem(mapfd, &i, &qsz, BPF_ANY);
+    if (ret < 0) {
+      log_error("Failed to update cpu-map %d ent", i);
+    }
+  }
+}
+
+static void
+llb_setup_lcpu_map(int mapfd)
+{
+  unsigned int live_cpus = bpf_num_online_cpus();
+  int ret, i;
+
+  i = 0;
+  ret = bpf_map_update_elem(mapfd, &i, &live_cpus, BPF_ANY);
+  if (ret < 0) {
+    log_error("Failed to update live cpu-map %d ent", i);
+    assert(0);
+  }
+}
+
 static int
 llb_dflt_sec_map2fd_all(struct bpf_object *bpf_obj)
 {
@@ -441,15 +724,18 @@ llb_dflt_sec_map2fd_all(struct bpf_object *bpf_obj)
   int err;
   int key = 0;
   struct bpf_program *prog;
-	const char *section;
+  const char *section;
 
   for (; i < LL_DP_MAX_MAP; i++) {
     fd = llb_objmap2fd(bpf_obj, xh->maps[i].map_name);  
     if (fd < 0) {
-      printf("BPF: map2fd failed %s\n", xh->maps[i].map_name);
+      log_error("BPF: map2fd failed %s", xh->maps[i].map_name);
       continue;
     }
     xh->maps[i].map_fd = fd;
+
+    if (!xh->have_loader) continue;
+
     if (i == LL_DP_PGM_MAP) {
       bpf_object__for_each_program(prog, bpf_obj) {
         bfd = bpf_program__fd(prog);
@@ -480,24 +766,48 @@ llb_dflt_sec_map2fd_all(struct bpf_object *bpf_obj)
       llb_setup_crc32c_map(fd);
     } else if (i == LL_DP_CTCTR_MAP) {
       llb_setup_ctctr_map(fd);
+    } else if (i == LL_DP_CPU_MAP) {
+      struct bpf_map *cpu_map = bpf_object__find_map_by_name(bpf_obj,
+                                                  xh->maps[i].map_name);
+      if (bpf_map__set_max_entries(cpu_map, libbpf_num_possible_cpus()) < 0) {
+        log_error("Failed to set max entries for cpu_map map: %s", strerror(errno));
+        //assert(0);
+      }
+      llb_setup_cpu_map(fd);
+    } else if (i == LL_DP_LCPU_MAP) {
+      struct bpf_map *cpu_map = bpf_object__find_map_by_name(bpf_obj,
+                                                  xh->maps[i].map_name);
+      if (bpf_map__set_max_entries(cpu_map, libbpf_num_online_cpus()) < 0) {
+        log_error("Failed to set max entries for live_cpu_map map: %s", strerror(errno));
+        //assert(0);
+      }
+      llb_setup_lcpu_map(fd);
     }
+  }
+
+  if (!xh->have_loader) {
+    return 0;
   }
 
   /* Clean previous pins */
   if (bpf_object__unpin_maps(bpf_obj, xh->ll_dp_pdir) != 0) {
-    printf("%s: Unpin maps failed\n", xh->ll_dp_pdir);
+    log_error("%s: Unpin maps failed", xh->ll_dp_pdir);
   }
 
   /* This will pin all maps in our bpf_object */
   err = bpf_object__pin_maps(bpf_obj, xh->ll_dp_pdir);
   if (err) {
-    printf("BPF: Object pin failed\n");
+    log_error("BPF: Object pin failed");
     //assert(0);
   }
 
-  llb_setup_pkt_ring(bpf_obj);
-
   return 0;
+}
+
+int
+llb_dp_maps_attach(llb_dp_struct_t *xh)
+{
+  return llb_dflt_sec_map2fd_all(NULL);
 }
 
 static int
@@ -537,7 +847,7 @@ llb_set_dev_up(char *ifname, bool up)
 }
 
 static int
-llb_mgmt_ch_init(llb_dp_struct_t *xh)
+llb_loader_init(llb_dp_struct_t *xh)
 {
   int fd;
   int ret;
@@ -711,10 +1021,6 @@ llb_xh_init(llb_dp_struct_t *xh)
   xh->maps[LL_DP_POL_MAP].has_pol  = 1;
   xh->maps[LL_DP_POL_MAP].max_entries = LLB_POL_MAP_ENTRIES;
 
-  xh->maps[LL_DP_FCV4_MAP].map_name = "fc_v4_map";
-  xh->maps[LL_DP_FCV4_MAP].has_pb   = 0;
-  xh->maps[LL_DP_FCV4_MAP].max_entries = LLB_FCV4_MAP_ENTRIES;
-
   xh->maps[LL_DP_NAT_MAP].map_name = "nat_map";
   xh->maps[LL_DP_NAT_MAP].has_pb   = 1;
   xh->maps[LL_DP_NAT_MAP].pb_xtid  = LL_DP_NAT_STATS_MAP;
@@ -760,6 +1066,14 @@ llb_xh_init(llb_dp_struct_t *xh)
   xh->maps[LL_DP_CTCTR_MAP].has_pb   = 0;
   xh->maps[LL_DP_CTCTR_MAP].max_entries = 1;
 
+  xh->maps[LL_DP_CPU_MAP].map_name = "cpu_map";
+  xh->maps[LL_DP_CPU_MAP].has_pb   = 0;
+  xh->maps[LL_DP_CPU_MAP].max_entries = 128;
+
+  xh->maps[LL_DP_LCPU_MAP].map_name = "live_cpu_map";
+  xh->maps[LL_DP_LCPU_MAP].has_pb   = 0;
+  xh->maps[LL_DP_LCPU_MAP].max_entries = 128;
+
   strcpy(xh->psecs[0].name, LLB_SECTION_PASS);
   strcpy(xh->psecs[1].name, XDP_LL_SEC_DEFAULT);
   xh->psecs[1].setup = llb_dflt_sec_map2fd_all;
@@ -770,8 +1084,12 @@ llb_xh_init(llb_dp_struct_t *xh)
   xh->ufw6 = pdi_map_alloc("ufw6", NULL, NULL);
   assert(xh->ufw6);
 
-  if (llb_mgmt_ch_init(xh) != 0) {
-    assert(0);
+  if (xh->have_loader) {
+    if (llb_loader_init(xh) != 0) {
+      assert(0);
+    }
+  } else {
+    llb_dp_maps_attach(xh);
   }
 
   if (xh->have_mtrace) {
@@ -791,8 +1109,7 @@ llb_clear_stats_pcpu_arr(int mfd, __u32 idx)
 
   memset(values, 0, sizeof(values));
   if (bpf_map_update_elem(mfd, &idx, values, 0) != 0) {
-    fprintf(stderr,
-      "ERR: bpf_map_lookup_elem failed idx:0x%X\n", idx);
+    log_error("bpf_map_lookup_elem failed idx:0x%X", idx);
     return;
   }
 }
@@ -811,8 +1128,7 @@ ll_get_stats_pcpu_arr(int mfd, __u32 idx,
   int i;
 
   if ((bpf_map_lookup_elem(mfd, &idx, values)) != 0) {
-    fprintf(stderr,
-      "ERR: bpf_map_lookup_elem failed idx:0x%X\n", idx);
+    log_error("bpf_map_lookup_elem failed idx:0x%X", idx);
     return;
   }
   
@@ -829,7 +1145,7 @@ ll_get_stats_pcpu_arr(int mfd, __u32 idx,
 
   if (s->st.packets || s->st.bytes) {
 #ifdef LLB_DP_STAT_DEBUG
-    printf("IDX %d: %llu:%llu\n",idx, 
+    log_debug("IDX %d: %llu:%llu",idx,
        (unsigned long long)(s->st.packets),
        (unsigned long long)(s->st.bytes));
 #endif
@@ -881,18 +1197,22 @@ llb_fetch_map_stats_cached(int tbl, uint32_t e, int raw,
 
   t = &xh->maps[tbl];
   if (t->has_pb && t->pb_xtid > 0) { 
-    if (t->pb_xtid < 0 || t->pb_xtid >= LL_DP_MAX_MAP)
+    if (t->pb_xtid >= LL_DP_MAX_MAP)
       return -1;
     
     t = &xh->maps[t->pb_xtid];
   }
 
-  /* FIXME : Handle non-pcpu */
+  if (!t->has_pb) {
+    return -1;
+  }
 
+  /* FIXME : Handle non-pcpu */
   pthread_rwlock_wrlock(&t->stat_lock);
   if (raw) {
     ll_get_stats_pcpu_arr(t->map_fd, e, &t->pbs[e], NULL);
   }
+
   if (e < t->max_entries) {
     *(uint64_t *)bytes = t->pbs[e].st.bytes;
     *(uint64_t *)packets = t->pbs[e].st.packets;
@@ -954,8 +1274,7 @@ llb_fetch_pol_map_stats(int tid, uint32_t e, void *ppass, void *pdrop)
     pthread_rwlock_wrlock(&t->stat_lock);
 
     if ((bpf_map_lookup_elem(t->map_fd, &e, &pa)) != 0) {
-      fprintf(stderr,
-        "ERR: bpf_map_lookup_elem failed idx:0x%X\n", e);
+      log_error("bpf_map_lookup_elem failed idx:0x%X\n", e);
       pthread_rwlock_unlock(&t->stat_lock);
       return -1;
     }
@@ -983,7 +1302,6 @@ llb_map_loop_and_delete(int tid, dp_map_walker_t cb, dp_map_ita_t *it)
   if (tid < 0 || tid >= LL_DP_MAX_MAP)
     return;
 
-
   t = &xh->maps[tid];
 
   while (bpf_map_get_next_key(t->map_fd, key, it->next_key) == 0) {
@@ -1006,8 +1324,8 @@ next:
   return;
 }
 
-void 
-llb_clear_map_stats(int tid, __u32 idx)
+static void
+llb_clear_map_stats_internal(int tid, __u32 idx, bool wipe)
 {
   int e = 0;
   llb_dp_map_t *t;
@@ -1016,28 +1334,30 @@ llb_clear_map_stats(int tid, __u32 idx)
     return;
 
   t = &xh->maps[tid];
-  if (t->has_pb && t->pb_xtid <= 0) {
+  if (t->has_pb) {
+    if (t->pb_xtid > 0) {
+      if (t->pb_xtid >= LL_DP_MAX_MAP)
+        return;
+      t = &xh->maps[t->pb_xtid];
+      if (!t->has_pb || t->pb_xtid > 0) {
+        return;
+      }
+    }
     /* FIXME : Handle non-pcpu */
-    if (idx >= 0) {
+    if (!wipe) {
         llb_clear_stats_pcpu_arr(t->map_fd, idx);
     } else {
       for (e = 0; e < t->max_entries; e++) {
         llb_clear_stats_pcpu_arr(t->map_fd, e);
       }
     }
-  } else if (t->has_pb && t->pb_xtid > 0) {
-    if (t->pb_xtid < 0 || t->pb_xtid >= LL_DP_MAX_MAP)
-      return;
-
-    t = &xh->maps[t->pb_xtid];
-    if (!t->has_pb || t->pb_xtid > 0) {
-      return;
-    }
-
-    if (idx >= 0) {
-        llb_clear_stats_pcpu_arr(t->map_fd, idx);
-    }
   }
+}
+
+void
+llb_clear_map_stats(int tid, __u32 idx)
+{
+  return llb_clear_map_stats_internal(tid, idx, false);
 }
 
 int
@@ -1063,6 +1383,33 @@ llb_add_map_elem_nat_post_proc(void *k, void *v)
     ep_arm = &na->nxfrms[i];
 
     if (ep_arm->inactive) {
+      inact_aids[j++] = i;
+    }
+  }
+
+  if (j > 0) {
+    ll_map_ct_rm_related(na->ca.cidx, inact_aids, j);
+  }
+
+  return 0;
+
+}
+
+static int
+llb_del_map_elem_nat_post_proc(void *k, void *v)
+{
+  struct dp_nat_tacts *na = v;
+  struct mf_xfrm_inf *ep_arm;
+  uint32_t inact_aids[LLB_MAX_NXFRMS];
+  int i = 0;
+  int j = 0;
+
+  memset(inact_aids, 0, sizeof(inact_aids));
+
+  for (i = 0; i < na->nxfrm && i < LLB_MAX_NXFRMS; i++) {
+    ep_arm = &na->nxfrms[i];
+
+    if (ep_arm->inactive == 0) {
       inact_aids[j++] = i;
     }
   }
@@ -1211,7 +1558,6 @@ llb_add_map_elem(int tbl, void *k, void *v)
   /* Any table which has stats pb needs to get stats cleared before use */
   if (tbl == LL_DP_NAT_MAP ||
       tbl == LL_DP_TMAC_MAP ||
-      tbl == LL_DP_TMAC_MAP ||
       tbl == LL_DP_FW4_MAP  ||
       tbl == LL_DP_RTV4_MAP) {
     __u32 cidx = 0;
@@ -1224,7 +1570,14 @@ llb_add_map_elem(int tbl, void *k, void *v)
       cidx = ca->cidx;
     }
 
-    llb_clear_map_stats(tbl, cidx);
+    if (tbl == LL_DP_NAT_MAP) {
+      int aid = 0;
+      for (aid = 0; aid < LLB_MAX_NXFRMS; aid++) {
+        llb_clear_map_stats(tbl, LLB_NAT_STAT_CID(cidx, aid));
+      }
+    } else {
+      llb_clear_map_stats(tbl, cidx);
+    }
   }
 
   if (tbl == LL_DP_FW4_MAP) {
@@ -1257,6 +1610,7 @@ ll_map_elem_cmp_cidx(int tid, void *k, void *ita)
 
   if (tid == LL_DP_CT_MAP || 
       tid == LL_DP_TMAC_MAP ||
+      tid == LL_DP_FCV4_MAP ||
       tid == LL_DP_RTV4_MAP) {
     struct dp_cmn_act *ca = it->val;
     if (ca->cidx == cidx) return 1;
@@ -1339,7 +1693,8 @@ int
 llb_del_map_elem(int tbl, void *k)
 {
   int ret = -EINVAL;
-  uint32_t cidx = 0;
+  struct dp_nat_tacts t = { 0 };
+
   if (tbl < 0 || tbl >= LL_DP_MAX_MAP) {
     return ret;
   }
@@ -1348,15 +1703,13 @@ llb_del_map_elem(int tbl, void *k)
 
   /* Need some pre-processing for certain maps */
   if (tbl == LL_DP_NAT_MAP) {
-    struct dp_nat_tacts t = { 0 };
     ret = bpf_map_lookup_elem(llb_map2fd(tbl), k, &t);
     if (ret != 0) {
       XH_UNLOCK();
       return -EINVAL;
     }
-    cidx = t.ca.cidx;
   }
-  
+
   if (tbl == LL_DP_FW4_MAP) {
     ret = llb_del_mf_map_elem__(tbl, k);
   } else {
@@ -1368,10 +1721,7 @@ llb_del_map_elem(int tbl, void *k)
 
   /* Need some post-processing for certain maps */
   if (tbl == LL_DP_NAT_MAP) {
-    if (cidx > 0) {
-      llb_del_map_elem_with_cidx(LL_DP_CT_MAP, cidx);
-      llb_clear_map_stats(LL_DP_CT_STATS_MAP, cidx);
-    }
+    llb_del_map_elem_nat_post_proc(k, &t);
   }
 
   XH_UNLOCK();
@@ -1432,7 +1782,9 @@ ll_age_fcmap(void)
   it.val = fc_val;
   it.uarg = &ns;
 
+  XH_LOCK();
   llb_map_loop_and_delete(LL_DP_FCV4_MAP, ll_fcmap_ent_has_aged, &it);
+  XH_UNLOCK();
   if (fc_val) free(fc_val);
 }
 
@@ -1447,9 +1799,12 @@ typedef struct ct_arg_struct
 
 static int
 ctm_proto_xfk_init(struct dp_ct_key *key,
-                   nxfrm_inf_t *xi,
-                   struct dp_ct_key *xkey)
+                   struct dp_ct_tact *adat,
+                   struct dp_ct_key *xkey,
+                   struct dp_ct_key *okey)
 {
+  nxfrm_inf_t *xi;
+
   DP_XADDR_CP(xkey->daddr, key->saddr);
   DP_XADDR_CP(xkey->saddr, key->daddr);
   xkey->sport = key->dport;
@@ -1458,7 +1813,9 @@ ctm_proto_xfk_init(struct dp_ct_key *key,
   xkey->zone = key->zone;
   xkey->v6 = key->v6;
 
-  if (xi->dsr) {
+  xi = &adat->ctd.xi;
+
+  if (xi->dsr || adat->ctd.pi.frag) {
     return 0;
   }
 
@@ -1546,6 +1903,7 @@ ll_ct_map_ent_has_aged(int tid, void *k, void *ita)
   dp_map_ita_t *it = ita;
   struct dp_ct_key *key = k;
   struct dp_ct_key xkey;
+  struct dp_ct_key okey;
   struct dp_ct_dat *dat;
   struct dp_ct_tact *adat;
   struct dp_ct_tact axdat;
@@ -1559,6 +1917,7 @@ ll_ct_map_ent_has_aged(int tid, void *k, void *ita)
   uint64_t to = CT_V4_CPTO;
   char dstr[INET6_ADDRSTRLEN];
   char sstr[INET6_ADDRSTRLEN];
+  uint64_t bytes, pkts;
   llb_dp_map_t *t;
 
   if (!it|| !it->uarg || !it->val) return 0;
@@ -1580,14 +1939,29 @@ ll_ct_map_ent_has_aged(int tid, void *k, void *ita)
     has_nat = true;
   }
 
-  ctm_proto_xfk_init(key, &adat->ctd.xi, &xkey);
+  ctm_proto_xfk_init(key, adat, &xkey, &okey);
 
   t = &xh->maps[LL_DP_CT_MAP];
-  if (bpf_map_lookup_elem(t->map_fd, &xkey, &axdat) != 0) {
-    printf("rdir ct4 not found %s:%d -> %s:%d (%d)\n",
-         dstr, ntohs(xkey.sport),
-         sstr, ntohs(xkey.dport),  
-         xkey.l4proto); 
+
+  if (adat->ctd.pi.frag) {
+    memset(&axdat, 0, sizeof(axdat));
+  } else if (bpf_map_lookup_elem(t->map_fd, &xkey, &axdat) != 0) {
+    if (key->v6 == 0) {
+      inet_ntop(AF_INET, xkey.saddr, sstr, INET_ADDRSTRLEN);
+      inet_ntop(AF_INET, xkey.daddr, dstr, INET_ADDRSTRLEN);
+    } else {
+      inet_ntop(AF_INET6, xkey.saddr, sstr, INET6_ADDRSTRLEN);
+      inet_ntop(AF_INET6, xkey.daddr, dstr, INET6_ADDRSTRLEN);
+    }
+
+    if (curr_ns - adat->lts < CT_MISMATCH_FN_CPTO) {
+      return 0;
+    }
+
+    log_trace("ct: rdir not found #%s:%d -> %s:%d (%d)#",
+         sstr, ntohs(xkey.sport),
+         dstr, ntohs(xkey.dport),
+         xkey.l4proto);
     llb_clear_map_stats(LL_DP_CT_STATS_MAP, adat->ca.cidx);
     return 1;
   }
@@ -1598,9 +1972,12 @@ ll_ct_map_ent_has_aged(int tid, void *k, void *ita)
     latest_ns = axdat.lts;
   }
 
-  if (dat->dir == CT_DIR_OUT) {
+  if (!adat->ctd.pi.frag && dat->dir == CT_DIR_OUT) {
     return 0;
   } 
+
+  llb_fetch_map_stats_cached(LL_DP_CT_STATS_MAP, adat->ca.cidx, 1, &bytes, &pkts);
+  llb_fetch_map_stats_cached(LL_DP_CT_STATS_MAP, adat->ca.cidx+1, 1, &bytes, &pkts);
 
   if (key->l4proto == IPPROTO_TCP) {
     ct_tcp_pinf_t *ts = &dat->pi.t;
@@ -1616,7 +1993,9 @@ ll_ct_map_ent_has_aged(int tid, void *k, void *ita)
   } else if (key->l4proto == IPPROTO_UDP) {
     ct_udp_pinf_t *us = &dat->pi.u;
  
-    if (us->state & (CT_UDP_UEST|CT_UDP_EST)) {
+    if (adat->ctd.pi.frag) {
+      to = CT_UDP_FN_CPTO;
+    } else if (us->state & (CT_UDP_UEST|CT_UDP_EST)) {
       to = CT_UDP_EST_CPTO;
       est = true;
     } else {
@@ -1655,15 +2034,35 @@ ll_ct_map_ent_has_aged(int tid, void *k, void *ita)
   llb_fetch_map_stats_used(LL_DP_CT_STATS_MAP, adat->ca.cidx+1, 1, &used2);
 
   if (curr_ns - latest_ns > to && !used1 && !used2) {
-    printf("##%s:%d -> %s:%d (%d):%u (Aged:%d:%d:%d)\n",
+    log_trace("ct: #%s:%d -> %s:%d (%d)# rid:%u est:%d nat:%d (Aged:%lluns:%d:%d)",
          sstr, ntohs(key->sport),
          dstr, ntohs(key->dport),  
-         key->l4proto, dat->rid, est, has_nat, used1 || used2);
+         key->l4proto, dat->rid,
+         est, has_nat, curr_ns - latest_ns,
+         used1, used2);
     ll_send_ctep_reset(key, adat);
-    ll_send_ctep_reset(&xkey, &axdat);
     llb_clear_map_stats(LL_DP_CT_STATS_MAP, adat->ca.cidx);
+
+    if (!adat->ctd.pi.frag) {
+      ll_send_ctep_reset(&xkey, &axdat);
+      llb_maptrace_uhook(LL_DP_CT_MAP, 0, &xkey, sizeof(xkey), NULL, 0);
+      bpf_map_delete_elem(t->map_fd, &xkey);
+      llb_clear_map_stats(LL_DP_CT_STATS_MAP, axdat.ca.cidx);
+    }
     return 1;
   }
+
+#ifdef LLB_DP_CT_DEBUG
+  log_trace("ct f(%d) alive: #%s:%d -> %s:%d (%d)# "
+         "rid:%u est:%d nat:%d (Diff:%llus:TO:%llus,%d:%d)",
+         adat->ctd.pi.frag,
+         sstr, ntohs(key->sport),
+         dstr, ntohs(key->dport),
+         key->l4proto, dat->rid,
+         est, has_nat, (curr_ns - latest_ns)/1000000000,
+         to/1000000000,
+         used1, used2);
+#endif
 
   return 0;
 }
@@ -1694,14 +2093,34 @@ ll_age_ctmap(void)
   it.val = adat;
   it.uarg = as;
 
+  XH_LOCK();
+  if (lost > 0) {
+    log_error("PerfBuf Lost count %lu", lost);
+    lost = 0;
+  }
+
   llb_map_loop_and_delete(LL_DP_CT_MAP, ll_ct_map_ent_has_aged, &it);
+  XH_UNLOCK();
   if (adat) free(adat);
   if (as) free(as);
 }
 
 void
+llb_xh_lock(void)
+{
+  XH_MPLOCK();
+}
+
+void
+llb_xh_unlock(void)
+{
+  XH_MPUNLOCK();
+}
+
+void
 llb_age_map_entries(int tbl)
 {
+  XH_MPLOCK();
   switch (tbl) {
   case LL_DP_FCV4_MAP:
     ll_age_fcmap();
@@ -1712,6 +2131,7 @@ llb_age_map_entries(int tbl)
   default:
     break;
   }
+  XH_MPUNLOCK();
 
   return;
 }
@@ -1745,11 +2165,15 @@ ll_ct_map_ent_rm_related(int tid, void *k, void *ita)
         inet_ntop(AF_INET6, &key->saddr[0], sstr, INET6_ADDRSTRLEN);
         inet_ntop(AF_INET6, &key->daddr[0], dstr, INET6_ADDRSTRLEN);
       }
-      printf("related ct rm %s:%d -> %s:%d (%d)\n",
+
+      log_debug("related ct rm %s:%d -> %s:%d (%d)",
          sstr, ntohs(key->sport),
          dstr, ntohs(key->dport),
          key->l4proto);
 
+      if (!key->v6) {
+        llb_del_map_elem_with_cidx(LL_DP_FCV4_MAP, adat->ca.cidx);
+      }
       llb_clear_map_stats(LL_DP_CT_STATS_MAP, adat->ca.cidx);
 
       return 1;
@@ -1805,7 +2229,7 @@ llb_set_rlims(void)
   };
 
   if (setrlimit(RLIMIT_MEMLOCK, &rlim_new)) {
-    fprintf(stderr, "Failed to increase RLIMIT_MEMLOCK limit!\n");
+    log_error("Failed to increase RLIMIT_MEMLOCK limit!");
     exit(1);
   }
 }
@@ -1846,8 +2270,8 @@ llb_link_prop_add(const char *ifname,
       l->nm++;
       
       XH_UNLOCK();
-      printf("%s: IF-%s ref idx %d:%d type %d\n", 
-              __FUNCTION__, ifname, n, mfree - 1, mp_type);
+      log_debug("%s: IF-%s ref idx %d:%d type %d",
+                __FUNCTION__, ifname, n, mfree - 1, mp_type);
       return 0;
     }
     if (!l->valid && !free) free = n+1;
@@ -1870,8 +2294,8 @@ llb_link_prop_add(const char *ifname,
 
   XH_UNLOCK();
 
-  printf("%s: IF-%s added idx %d type %d\n", 
-         __FUNCTION__, ifname, free-1, mp_type);
+  log_debug("%s: IF-%s added idx %d type %d",
+            __FUNCTION__, ifname, free-1, mp_type);
 
   return 0;
 }
@@ -1921,17 +2345,15 @@ llb_psec_add(const char *psec)
   for (; n < LLB_PSECS; n++) {
     s = &xh->psecs[n];
     if (strncmp(s->name, psec, SECNAMSIZ) == 0) {
-      if (s->valid) {
-        s->ref++;
-        ret = s->ref;
-        XH_UNLOCK();
-        return ret;
-      } else {
+      if (!s->valid) {
+        ret = 0;
         s->valid = 1;
-        s->ref = 0;
-        XH_UNLOCK();
-        return 0;
+      } else {
+        ret = 1;
       }
+      s->ref++;
+      XH_UNLOCK();
+      return ret;
     }
     if (!s->valid && !free) free = n+1;
   }
@@ -1947,7 +2369,7 @@ llb_psec_add(const char *psec)
   strncpy(s->name, psec, SECNAMSIZ);
   s->name[SECNAMSIZ-1] = '\0';
 
-  printf("%s: SEC-%s added idx %d\n", __FUNCTION__, psec, free-1);
+  log_debug("%s: SEC-%s added idx %d", __FUNCTION__, psec, free-1);
 
   XH_UNLOCK();
 
@@ -1965,12 +2387,13 @@ llb_psec_del(const char *psec)
     s = &xh->psecs[n];
     if (strncmp(s->name, psec, SECNAMSIZ) == 0 && s->valid) {
       if (s->ref == 0)  {
-        s->valid = 0;
         s->ref = 0;
         XH_UNLOCK();
         return 0;
       } else {
-        s->ref--;
+        if (s->ref > 0) {
+          s->ref--;
+        }
         XH_UNLOCK();
         return 0;
       }
@@ -2015,19 +2438,19 @@ llb_ebpf_link_attach(struct config *cfg)
     /* ntc is netlox's modified tc tool */
     sprintf(cmd, "ntc qdisc add dev %s clsact 2>&1 >/dev/null", cfg->ifname);
     llb_sys_exec(cmd);
-    printf("%s\n", cmd);    
+    log_debug("%s", cmd);
 
     sprintf(cmd, "ntc filter add dev %s ingress bpf da obj %s sec %s 2>&1",
             cfg->ifname, cfg->filename, cfg->progsec);
     llb_sys_exec(cmd);
-    printf("%s\n", cmd);
+    log_debug("%s", cmd);
 
-#ifdef HAVE_DP_EGR_HOOK
-    sprintf(cmd, "ntc filter add dev %s egress bpf da obj %s sec %s 2>&1",
-            cfg->ifname, cfg->filename, cfg->progsec);
-    llb_sys_exec(cmd);
-    printf("%s\n", cmd);
-#endif
+    if (cfg->tc_egr_bpf) {
+      sprintf(cmd, "ntc filter add dev %s egress bpf da obj %s sec %s 2>&1",
+            cfg->ifname, LLB_FP_IMG_BPF_EGR, cfg->progsec);
+      llb_sys_exec(cmd);
+      log_debug("%s", cmd);
+    }
 
     return 0;
   } else {
@@ -2042,14 +2465,14 @@ llb_ebpf_link_detach(struct config *cfg)
 
   if (cfg->tc_bpf) {
     /* ntc is netlox's modified tc tool */
-#ifdef HAVE_DP_EGR_HOOK
-    sprintf(cmd, "ntc filter del dev %s egress 2>&1", cfg->ifname);
-    printf("%s\n", cmd);
-    llb_sys_exec(cmd);
-#endif
+    if (cfg->tc_egr_bpf) {
+      sprintf(cmd, "ntc filter del dev %s egress 2>&1", cfg->ifname);
+      log_debug("%s\n", cmd);
+      llb_sys_exec(cmd);
+    }
 
     sprintf(cmd, "ntc filter del dev %s ingress 2>&1", cfg->ifname);
-    printf("%s\n", cmd);    
+    log_debug("%s", cmd);
     llb_sys_exec(cmd);
     return 0;
   } else {
@@ -2064,26 +2487,35 @@ llb_dp_link_attach(const char *ifname,
                    int unload)
 {
   struct bpf_object *bpf_obj;
-	struct config cfg;
+  struct config cfg;
   int nr = 0;
+  int must_load = 0;
 
   assert(psec);
   assert(ifname);
 
-	/* Cmdline options can change progsec */
+  /* Cmdline options can change progsec */
   memset(&cfg, 0, sizeof(cfg));
   strncpy(cfg.progsec,  psec,  sizeof(cfg.progsec));
 
   if (mp_type == LL_BPF_MOUNT_TC) {
     strncpy(cfg.filename, xh->ll_tc_fname, sizeof(cfg.filename));
     cfg.tc_bpf = 1;
+    if (xh->egr_hooks) {
+      cfg.tc_egr_bpf = 1;
+    }
   } else {
     strncpy(cfg.filename, xh->ll_dp_fname, sizeof(cfg.filename));
   }
 
   strncpy(cfg.pin_dir,  xh->ll_dp_pdir,  sizeof(cfg.pin_dir));
-  if (strcmp(ifname, LLB_MGMT_CHANNEL) == 0)
+  if (strcmp(ifname, LLB_MGMT_CHANNEL) == 0) {
     cfg.xdp_flags |= XDP_FLAGS_SKB_MODE;
+    must_load = 1;
+  }
+
+  /* Large MTU not supported until kernel 5.18 */
+  cfg.xdp_flags |= XDP_FLAGS_SKB_MODE;
   cfg.xdp_flags &= ~XDP_FLAGS_UPDATE_IF_NOEXIST;
   cfg.ifname = (char *)&cfg.ifname_buf;
   strncpy(cfg.ifname, ifname, IF_NAMESIZE);
@@ -2101,13 +2533,13 @@ llb_dp_link_attach(const char *ifname,
   }
 
   nr = llb_psec_add(psec);
-  printf("NR %d PSEC %s %s\n", nr, psec, cfg.filename);
+  log_debug("NR %d PSEC %s %s", nr, psec, cfg.filename);
   if (nr > 0) {
     cfg.reuse_maps = 1;
   }
 
   bpf_obj = llb_ebpf_link_attach(&cfg);
-  if (!bpf_obj && mp_type == LL_BPF_MOUNT_XDP) {
+  if (!bpf_obj && mp_type == LL_BPF_MOUNT_XDP && must_load) {
     llb_psec_del(psec);
     return -1;
   }
@@ -2120,16 +2552,31 @@ llb_dp_link_attach(const char *ifname,
   }
 
   if (nr == 0 && mp_type == LL_BPF_MOUNT_XDP) {
-    printf("Setting up for %s|%s\n", ifname, psec);
+    log_debug("Setting up for %s|%s", ifname, psec);
     llb_psec_setup(psec, bpf_obj);
   }
 
   return 0;
 }
 
+void
+loxilb_set_loglevel(struct ebpfcfg *cfg)
+{
+  if (cfg->loglevel < 0 ||  cfg->loglevel >= LOG_FATAL) {
+    cfg->loglevel = LOG_INFO;
+  }
+
+  log_set_level(cfg->loglevel);
+  if (xh->logfp) {
+      log_add_fp(xh->logfp, cfg->loglevel);
+  }
+  log_warn("ebpf: new loglevel %d", cfg->loglevel);
+}
+
 int
 loxilb_main(struct ebpfcfg *cfg)
 {
+  FILE *fp;
   libbpf_set_print(libbpf_print_fn);
   llb_set_rlims();
 
@@ -2138,8 +2585,21 @@ loxilb_main(struct ebpfcfg *cfg)
 
   /* Save any special config parameters */
   if (cfg) {
+
+    fp = fopen (LOXILB_DP_LOGF, "a");
+    assert(fp);
+
+    if (cfg->loglevel < 0 ||  cfg->loglevel >= LOG_FATAL) {
+      cfg->loglevel = LOG_INFO;
+    }
+    log_add_fp(fp, cfg->loglevel);
+
+    xh->have_loader = !cfg->no_loader;
     xh->have_mtrace = cfg->have_mtrace;
+    xh->have_ptrace = cfg->have_ptrace;
     xh->nodenum = cfg->nodenum;
+    xh->egr_hooks = cfg->egr_hooks;
+    xh->logfp = fp;
   }
 
   llb_xh_init(xh);

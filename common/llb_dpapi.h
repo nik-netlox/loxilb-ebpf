@@ -11,6 +11,7 @@
 #define LLB_SECTION_PASS      "xdp_pass"
 #define LLB_FP_IMG_DEFAULT    "/opt/loxilb/llb_xdp_main.o"
 #define LLB_FP_IMG_BPF        "/opt/loxilb/llb_ebpf_main.o"
+#define LLB_FP_IMG_BPF_EGR    "/opt/loxilb/llb_ebpf_emain.o"
 #define LLB_DB_MAP_PDIR       "/opt/loxilb/dp/bpf"
 
 #define LLB_MAX_LB_NODES      (2)
@@ -39,6 +40,8 @@
 #define LLB_PSECS             (8)
 #define LLB_MAX_NXFRMS        (16)
 #define LLB_CRC32C_ENTRIES    (256)
+#define LLB_MAX_MHOSTS        (3)
+#define LLB_MAX_MPHOSTS       (7)
 
 #define LLB_DP_SUNP_PGM_ID2    (6)
 #define LLB_DP_CRC_PGM_ID2     (5)
@@ -47,6 +50,8 @@
 #define LLB_DP_CT_PGM_ID       (2)
 #define LLB_DP_PKT_SLOW_PGM_ID (1)
 #define LLB_DP_PKT_PGM_ID      (0)
+
+#define LLB_NAT_STAT_CID(rid, aid) ((((rid) & 0xfff) << 4) | (aid & 0xf))
 
 /* Hard-timeout of 40s for fc dp entry */
 #define FC_V4_DPTO            (60000000000)
@@ -64,6 +69,7 @@
 #define CT_UDP_EST_CPTO       (60000000000)
 #define CT_ICMP_EST_CPTO      (20000000000)
 #define CT_ICMP_FN_CPTO       (10000000000)
+#define CT_MISMATCH_FN_CPTO   (180000000000)
 
 #define DP_XADDR_ISZR(a) ((a)[0] == 0 && \
                           (a)[1] == 0 && \
@@ -118,6 +124,8 @@ enum llb_dp_tid {
   LL_DP_FW4_STATS_MAP,
   LL_DP_CRC32C_MAP,
   LL_DP_CTCTR_MAP,
+  LL_DP_CPU_MAP,
+  LL_DP_LCPU_MAP,
   LL_DP_MAX_MAP
 };
 
@@ -333,7 +341,8 @@ struct dp_fc_tacts {
   struct dp_cmn_act ca;
   __u64 its;
   __u32 zone;
-  __u32 pad;
+  __u16 pad;
+  __u16 pten;
   struct dp_fc_tact fcta[LLB_FCV4_MAP_ACTS];
 };
 
@@ -398,7 +407,11 @@ struct dp_intf_tact_set_ifi {
   __u16 mirr;
   __u16 polid;
   __u8  pprop;
-  __u8  r[5];
+#define DP_PTEN_ALL   2
+#define DP_PTEN_TRAP  1
+#define DP_PTEN_DIS   0
+  __u8  pten;
+  __u8  r[4];
 };
 
 struct dp_intf_tact {
@@ -537,9 +550,8 @@ typedef enum {
 } ct_icmp_state_t;
 
 typedef struct {
-  __u32 hstate;
-  __u32 seq;
-  __u16 init_acks;
+  __u32 nh;
+  __be32 mh_host[LLB_MAX_MHOSTS+1];
 } ct_sctp_pinfd_t;
 
 #define CT_SCTP_FIN_MASK (CT_SCTP_SHUT|CT_SCTP_SHUTA|CT_SCTP_SHUTC|CT_SCTP_ABRT)
@@ -557,15 +569,15 @@ typedef enum {
   CT_SCTP_SHUTC   = 0x80,
   CT_SCTP_ERR     = 0x100,
   CT_SCTP_ABRT    = 0x200
-} ct_stcp_state_t;
+} ct_sctp_state_t;
 
 typedef struct {
-  ct_stcp_state_t state;
+  ct_sctp_state_t state;
   ct_dir_t fndir;
   uint32_t itag;
   uint32_t otag;
   uint32_t cookie;
-  ct_sctp_pinfd_t stcp_cts[CT_DIR_MAX];
+  ct_sctp_pinfd_t sctp_cts[CT_DIR_MAX];
 } ct_sctp_pinf_t;
 
 typedef struct {
@@ -585,7 +597,9 @@ typedef struct {
     ct_icmp_pinf_t i;
     ct_sctp_pinf_t s;
   };
-  __u32 frag;
+  __u16 frag;
+  __u16 npmhh;
+  __u32 pmhh[4];
   ct_l3inf_t l3i;
 } ct_pinf_t;
 
@@ -597,18 +611,22 @@ struct mf_xfrm_inf
   /* LLB_NAT_XXX flags */
   uint8_t nat_flags;
   uint8_t inactive;
-  uint16_t wprio;
+  uint8_t wprio;
   uint8_t nv6;
   uint8_t dsr;
+  uint8_t mhon;
   uint16_t nat_xport;
   uint32_t nat_xip[4];
   uint32_t nat_rip[4];
+  uint16_t osp;
+  uint16_t odp;
 };
 typedef struct mf_xfrm_inf nxfrm_inf_t;
 
 struct dp_ct_dat {
-  __u32 rid;
-  __u32 aid;
+  __u16 rid;
+  __u16 aid;
+  __u32 nid;
   ct_pinf_t pi;
   ct_dir_t dir;
   ct_smr_t smr;
@@ -705,9 +723,11 @@ struct dp_nat_tacts {
   uint64_t ito;
   struct bpf_spin_lock lock;
   uint16_t nxfrm;
-  uint16_t cdis;
+  uint8_t cdis;
+  uint8_t npmhh;
   uint16_t sel_hint;
   uint16_t sel_type;
+  uint32_t pmhh[LLB_MAX_MHOSTS];
   struct mf_xfrm_inf nxfrms[LLB_MAX_NXFRMS];
 };
 
@@ -741,12 +761,13 @@ struct dp_ct_ctrtact {
 
 struct ll_dp_pmdi {
   __u32 ifindex;
-  __u16 xdp_inport;
-  __u8  table_id;
-  __u8  rcode;
-  __u16 pkt_len;
-  __u16 xdp_oport;
-  __u8  pad[4];   /* Align to 64-bit boundary */
+  __u16 dp_inport;
+  __u16 dp_oport;
+  __u32 rcode;
+  __u16 table_id;
+  __u16 phit ;
+  __u32 pkt_len;
+  __u32 pad;
   uint8_t data[];
 }; 
 
@@ -800,5 +821,7 @@ int llb_add_map_elem(int tbl, void *k, void *v);
 int llb_del_map_elem(int tbl, void *k);
 void llb_map_loop_and_delete(int tbl, dp_map_walker_t cb, dp_map_ita_t *it);
 int llb_dp_link_attach(const char *ifname, const char *psec, int mp_type, int unload);
+void llb_xh_lock(void);
+void llb_xh_unlock(void);
 
 #endif /* __LLB_DPAPI_H__ */
